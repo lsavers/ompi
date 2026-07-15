@@ -17,6 +17,43 @@
 #include "opal/util/output.h"
 #include "ompi/info/info_memkind.h"
 #include <string.h>
+#include <stdint.h>
+#include <stdbool.h>
+
+#define MCA_ACCELERATOR_ROCM_HOST_CACHE_SIZE 4096
+
+typedef struct {
+    const void *addr;
+} mca_accelerator_rocm_host_cache_entry_t;
+
+static mca_accelerator_rocm_host_cache_entry_t mca_accelerator_rocm_host_cache[MCA_ACCELERATOR_ROCM_HOST_CACHE_SIZE];
+static opal_mutex_t mca_accelerator_rocm_host_cache_lock = OPAL_MUTEX_STATIC_INIT;
+
+static inline size_t mca_accelerator_rocm_host_cache_index(const void *addr)
+{
+    return (((uintptr_t) addr) >> 6) & (MCA_ACCELERATOR_ROCM_HOST_CACHE_SIZE - 1);
+}
+
+static inline bool mca_accelerator_rocm_host_cache_lookup(const void *addr)
+{
+    size_t index = mca_accelerator_rocm_host_cache_index(addr);
+    bool found;
+
+    OPAL_THREAD_LOCK(&mca_accelerator_rocm_host_cache_lock);
+    found = (mca_accelerator_rocm_host_cache[index].addr == addr);
+    OPAL_THREAD_UNLOCK(&mca_accelerator_rocm_host_cache_lock);
+
+    return found;
+}
+
+static inline void mca_accelerator_rocm_host_cache_insert(const void *addr)
+{
+    size_t index = mca_accelerator_rocm_host_cache_index(addr);
+
+    OPAL_THREAD_LOCK(&mca_accelerator_rocm_host_cache_lock);
+    mca_accelerator_rocm_host_cache[index].addr = addr;
+    OPAL_THREAD_UNLOCK(&mca_accelerator_rocm_host_cache_lock);
+}
 
 /* Accelerator API's */
 static int mca_accelerator_rocm_check_addr(const void *addr, int *dev_id, uint64_t *flags);
@@ -138,6 +175,10 @@ static int mca_accelerator_rocm_check_addr (const void *addr, int *dev_id, uint6
     }
 
     *flags = 0;
+    if (mca_accelerator_rocm_host_cache_lookup(addr)) {
+        return 0;
+    }
+
     err = hipPointerGetAttributes(&srcAttr, addr);
     if (hipSuccess == err) {
 #if HIP_VERSION >= 50731921
@@ -157,7 +198,11 @@ static int mca_accelerator_rocm_check_addr (const void *addr, int *dev_id, uint6
             opal_accelerator_rocm_lazy_init();
             *dev_id = srcAttr.device;
             ret = 1;
+        } else {
+            mca_accelerator_rocm_host_cache_insert(addr);
         }
+    } else {
+        return ret;
     }
 
     return ret;
