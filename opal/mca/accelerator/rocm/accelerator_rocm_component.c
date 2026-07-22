@@ -29,6 +29,7 @@
 
 int opal_accelerator_rocm_memcpy_async = 0;
 int opal_accelerator_rocm_verbose = 0;
+bool opal_accelerator_rocm_cache_validate = false;
 size_t opal_accelerator_rocm_memcpyD2H_limit=1024;
 size_t opal_accelerator_rocm_memcpyH2D_limit=1048576;
 
@@ -141,6 +142,16 @@ static int accelerator_rocm_component_register(void)
                                               0, OPAL_INFO_LVL_9, MCA_BASE_VAR_SCOPE_READONLY,
                                               &opal_accelerator_rocm_verbose);
     (void) mca_base_var_register_synonym (var_id, "ompi", "mpi", "accelerator_rocm", "verbose",
+                                          MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
+
+    opal_accelerator_rocm_cache_validate = false;
+    var_id = mca_base_component_var_register (&mca_accelerator_rocm_component.super.base_version,
+                                              "cache_validate",
+                                              "Validate cached ROCm pointer classifications with allocation buffer IDs",
+                                              MCA_BASE_VAR_TYPE_BOOL, NULL, 0, 0,
+                                              OPAL_INFO_LVL_9, MCA_BASE_VAR_SCOPE_READONLY,
+                                              &opal_accelerator_rocm_cache_validate);
+    (void) mca_base_var_register_synonym (var_id, "ompi", "mpi", "accelerator_rocm", "cache_validate",
                                           MCA_BASE_VAR_SYN_FLAG_DEPRECATED);
 
     /* Switching point between using memcpy and hipMemcpy* functions. */

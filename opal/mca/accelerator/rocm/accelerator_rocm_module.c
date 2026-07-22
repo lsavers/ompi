@@ -24,18 +24,30 @@
 
 typedef struct {
     const void *addr;
+    const void *base;
+    size_t size;
+    opal_accelerator_buffer_id_t buffer_id;
+    bool has_buffer_id;
     int ret;
     int dev_id;
     uint64_t flags;
 } mca_accelerator_rocm_class_cache_entry_t;
+
+static int mca_accelerator_rocm_get_address_range(int dev_id, const void *ptr, void **base,
+                                                  size_t *size);
+static int mca_accelerator_rocm_get_buffer_id_readonly(const void *addr,
+                                                       opal_accelerator_buffer_id_t *buf_id);
+static int mca_accelerator_rocm_get_buffer_id(int dev_id, const void *addr,
+                                              opal_accelerator_buffer_id_t *buf_id);
 
 static mca_accelerator_rocm_class_cache_entry_t mca_accelerator_rocm_class_cache[MCA_ACCELERATOR_ROCM_CLASS_CACHE_SIZE];
 static opal_mutex_t mca_accelerator_rocm_class_cache_lock = OPAL_MUTEX_STATIC_INIT;
 
 /* Cache only successful HIP classifications. HIP errors are intentionally
  * uncached so transient failures or stale virtual-address reuse fall back to
- * hipPointerGetAttributes(). The cache is exact-address only; entries for
- * Open MPI-owned ROCm allocations are cleared on release below.
+ * hipPointerGetAttributes(). Device/unified entries also record allocation
+ * range and buffer ID when ROCm exposes them; range hits and validation mode
+ * recheck the buffer ID and evict entries whose virtual address was reused.
  */
 
 static inline size_t mca_accelerator_rocm_class_cache_index(const void *addr)
@@ -43,44 +55,115 @@ static inline size_t mca_accelerator_rocm_class_cache_index(const void *addr)
     return (((uintptr_t) addr) >> 6) & (MCA_ACCELERATOR_ROCM_CLASS_CACHE_SIZE - 1);
 }
 
+static inline bool mca_accelerator_rocm_class_cache_range_contains(
+    const mca_accelerator_rocm_class_cache_entry_t *entry, const void *addr)
+{
+    uintptr_t value = (uintptr_t) addr;
+    uintptr_t base = (uintptr_t) entry->base;
+
+    return (NULL != entry->base && 0 < entry->size && base <= value && value - base < entry->size);
+}
+
+static inline bool mca_accelerator_rocm_class_cache_revalidate(
+    const mca_accelerator_rocm_class_cache_entry_t *entry, const void *addr)
+{
+    opal_accelerator_buffer_id_t buffer_id;
+
+    if (!entry->has_buffer_id || 0 >= entry->ret) {
+        return true;
+    }
+
+    const void *query_addr = NULL != entry->base ? entry->base : addr;
+    if (OPAL_SUCCESS != mca_accelerator_rocm_get_buffer_id_readonly(query_addr, &buffer_id)) {
+        return false;
+    }
+
+    return buffer_id == entry->buffer_id;
+}
+
 static inline bool mca_accelerator_rocm_class_cache_lookup(const void *addr, int *ret, int *dev_id,
                                                            uint64_t *flags)
 {
+    mca_accelerator_rocm_class_cache_entry_t entry;
     size_t index = mca_accelerator_rocm_class_cache_index(addr);
-    bool found;
+    size_t found_index = index;
+    bool found = false;
 
     OPAL_THREAD_LOCK(&mca_accelerator_rocm_class_cache_lock);
-    found = (mca_accelerator_rocm_class_cache[index].addr == addr);
-    if (found) {
-        *ret = mca_accelerator_rocm_class_cache[index].ret;
-        *dev_id = mca_accelerator_rocm_class_cache[index].dev_id;
-        *flags = mca_accelerator_rocm_class_cache[index].flags;
+    if (mca_accelerator_rocm_class_cache[index].addr == addr) {
+        entry = mca_accelerator_rocm_class_cache[index];
+        found = true;
+    } else {
+        for (size_t i = 0; i < MCA_ACCELERATOR_ROCM_CLASS_CACHE_SIZE; ++i) {
+            if (mca_accelerator_rocm_class_cache_range_contains(&mca_accelerator_rocm_class_cache[i],
+                                                                addr)) {
+                entry = mca_accelerator_rocm_class_cache[i];
+                found_index = i;
+                found = true;
+                break;
+            }
+        }
     }
     OPAL_THREAD_UNLOCK(&mca_accelerator_rocm_class_cache_lock);
 
-    return found;
+    if (!found) {
+        return false;
+    }
+
+    if (entry.addr != addr || opal_accelerator_rocm_cache_validate) {
+        if (!mca_accelerator_rocm_class_cache_revalidate(&entry, addr)) {
+            OPAL_THREAD_LOCK(&mca_accelerator_rocm_class_cache_lock);
+            if (mca_accelerator_rocm_class_cache[found_index].addr == entry.addr) {
+                mca_accelerator_rocm_class_cache[found_index].addr = NULL;
+            }
+            OPAL_THREAD_UNLOCK(&mca_accelerator_rocm_class_cache_lock);
+            return false;
+        }
+    }
+
+    *ret = entry.ret;
+    *dev_id = entry.dev_id;
+    *flags = entry.flags;
+    return true;
 }
 
 static inline void mca_accelerator_rocm_class_cache_insert(const void *addr, int ret, int dev_id,
                                                            uint64_t flags)
 {
+    mca_accelerator_rocm_class_cache_entry_t entry = {.addr = addr,
+                                                      .ret = ret,
+                                                      .dev_id = dev_id,
+                                                      .flags = flags};
     size_t index = mca_accelerator_rocm_class_cache_index(addr);
+    void *base;
+    size_t size;
+    opal_accelerator_buffer_id_t buffer_id;
+
+    if (0 < ret && OPAL_SUCCESS == mca_accelerator_rocm_get_address_range(MCA_ACCELERATOR_NO_DEVICE_ID,
+                                                                           addr, &base, &size)) {
+        entry.base = base;
+        entry.size = size;
+        if (OPAL_SUCCESS == mca_accelerator_rocm_get_buffer_id(MCA_ACCELERATOR_NO_DEVICE_ID, base,
+                                                               &buffer_id)) {
+            entry.buffer_id = buffer_id;
+            entry.has_buffer_id = true;
+        }
+    }
 
     OPAL_THREAD_LOCK(&mca_accelerator_rocm_class_cache_lock);
-    mca_accelerator_rocm_class_cache[index].addr = addr;
-    mca_accelerator_rocm_class_cache[index].ret = ret;
-    mca_accelerator_rocm_class_cache[index].dev_id = dev_id;
-    mca_accelerator_rocm_class_cache[index].flags = flags;
+    mca_accelerator_rocm_class_cache[index] = entry;
     OPAL_THREAD_UNLOCK(&mca_accelerator_rocm_class_cache_lock);
 }
 
 static inline void mca_accelerator_rocm_class_cache_clear(const void *addr)
 {
-    size_t index = mca_accelerator_rocm_class_cache_index(addr);
-
     OPAL_THREAD_LOCK(&mca_accelerator_rocm_class_cache_lock);
-    if (mca_accelerator_rocm_class_cache[index].addr == addr) {
-        mca_accelerator_rocm_class_cache[index].addr = NULL;
+    for (size_t i = 0; i < MCA_ACCELERATOR_ROCM_CLASS_CACHE_SIZE; ++i) {
+        if (mca_accelerator_rocm_class_cache[i].addr == addr
+            || mca_accelerator_rocm_class_cache_range_contains(&mca_accelerator_rocm_class_cache[i],
+                                                               addr)) {
+            mca_accelerator_rocm_class_cache[i].addr = NULL;
+        }
     }
     OPAL_THREAD_UNLOCK(&mca_accelerator_rocm_class_cache_lock);
 }
@@ -923,7 +1006,7 @@ static int mca_accelerator_rocm_device_can_access_peer(int *access, int dev1, in
     return OPAL_SUCCESS;
 }
 
-static int mca_accelerator_rocm_get_buffer_id(int dev_id, const void *addr, opal_accelerator_buffer_id_t *buf_id)
+static int mca_accelerator_rocm_get_buffer_id_readonly(const void *addr, opal_accelerator_buffer_id_t *buf_id)
 {
     *buf_id = 0;
 
@@ -936,6 +1019,16 @@ static int mca_accelerator_rocm_get_buffer_id(int dev_id, const void *addr, opal
         return OPAL_ERROR;
     }
 #endif
+
+    return OPAL_SUCCESS;
+}
+
+static int mca_accelerator_rocm_get_buffer_id(int dev_id, const void *addr, opal_accelerator_buffer_id_t *buf_id)
+{
+    int rc = mca_accelerator_rocm_get_buffer_id_readonly(addr, buf_id);
+    if (OPAL_SUCCESS != rc) {
+        return rc;
+    }
 
 #if HIP_VERSION >= 50530201
     int enable = 1;

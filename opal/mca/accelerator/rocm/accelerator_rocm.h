@@ -16,6 +16,7 @@
 
 #include "opal_config.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 
 /* Not interested in warnings generated in hip_runtime_api.h */
@@ -73,6 +74,7 @@ OBJ_CLASS_DECLARATION(opal_accelerator_rocm_ipc_event_handle_t);
 extern hipStream_t *opal_accelerator_rocm_MemcpyStream;
 extern int opal_accelerator_rocm_memcpy_async;
 extern int opal_accelerator_rocm_verbose;
+extern bool opal_accelerator_rocm_cache_validate;
 extern size_t opal_accelerator_rocm_memcpyH2D_limit;
 extern size_t opal_accelerator_rocm_memcpyD2H_limit;
 extern int opal_accelerator_rocm_num_devices;
